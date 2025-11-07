@@ -3,6 +3,10 @@ import {parse} from "shell-quote";
 const {console, core, preferences, utils, http, file} = iina;
 
 const HOME_PATH = '~/Library/Application Support/com.colliderli.iina/plugins/';
+const STREAM_CHUNK_SECONDS = 10;
+const SAMPLE_RATE = 16000;
+const PCM_BYTES_PER_SAMPLE = 2;
+const WAV_HEADER_BYTES = 44;
 
 export async function transcribe(model) {
     await downloadOrGetModel(model);
@@ -42,12 +46,80 @@ async function transcribeAudio(tempWavName, modelName, sourceMediaPath) {
     const server = await startWhisperServer(modelName);
     const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
     try {
-        const srtContent = await requestTranscriptionFromServer(server, tempWavName);
-        file.write(subtitlePath, srtContent);
+        await streamTranscription(server, tempWavName, subtitlePath);
         await persistSubtitleCopy(subtitlePath, sourceMediaPath);
         return subtitlePath;
     } finally {
         await stopWhisperServer(server);
+    }
+}
+
+async function streamTranscription(serverInfo, wavPath, subtitlePath) {
+    const aggregatedSegments = [];
+    const totalDurationMs = await estimateAudioDurationMs(wavPath);
+    if (!totalDurationMs || totalDurationMs <= STREAM_CHUNK_SECONDS * 1000) {
+        const srtContent = await requestTranscriptionFromServer(serverInfo, wavPath);
+        aggregatedSegments.push(...shiftSrtBlocks(parseSrtBlocks(srtContent), 0));
+        const rendered = renderSegmentsToSrt(aggregatedSegments);
+        file.write(subtitlePath, rendered);
+        await reloadSubtitleTrack(subtitlePath);
+        return;
+    }
+    let processedMs = 0;
+    let chunkIndex = 0;
+    while (processedMs < totalDurationMs) {
+        const remainingMs = totalDurationMs - processedMs;
+        const chunkDurationMs = Math.min(STREAM_CHUNK_SECONDS * 1000, remainingMs);
+        const chunkPath = utils.resolvePath(`@tmp/whisper_chunk_${chunkIndex}.wav`);
+        try {
+            await extractAudioChunk(wavPath, chunkPath, processedMs, chunkDurationMs);
+            const chunkSrt = await requestTranscriptionFromServer(serverInfo, chunkPath);
+            aggregatedSegments.push(...shiftSrtBlocks(parseSrtBlocks(chunkSrt), processedMs));
+            const rendered = renderSegmentsToSrt(aggregatedSegments);
+            file.write(subtitlePath, rendered);
+            await reloadSubtitleTrack(subtitlePath);
+            processedMs += chunkDurationMs;
+            chunkIndex += 1;
+        } finally {
+            await removeFileQuietly(chunkPath);
+        }
+    }
+}
+
+async function extractAudioChunk(sourcePath, outputPath, startMs, durationMs) {
+    const startSeconds = (startMs / 1000).toFixed(3);
+    const durationSeconds = (durationMs / 1000).toFixed(3);
+    await execWrapped(getFfmpegPath(), [
+        '-y',
+        '-ss',
+        startSeconds,
+        '-t',
+        durationSeconds,
+        '-i',
+        sourcePath,
+        '-ar',
+        `${SAMPLE_RATE}`,
+        '-ac',
+        '1',
+        '-c:a',
+        'pcm_s16le',
+        outputPath,
+    ]);
+}
+
+async function reloadSubtitleTrack(subtitlePath) {
+    try {
+        core.subtitle.loadTrack(subtitlePath);
+    } catch (error) {
+        console.warn(`Failed to reload subtitle track: ${error.message}`);
+    }
+}
+
+async function removeFileQuietly(path) {
+    try {
+        await utils.exec("/bin/rm", ["-f", path]);
+    } catch (error) {
+        console.warn(`Unable to remove temp file ${path}: ${error.message}`);
     }
 }
 
@@ -164,6 +236,107 @@ function getPluginHomePath() {
 
 function getPluginDataPath() {
     return utils.resolvePath("@data/")
+}
+
+async function estimateAudioDurationMs(wavPath) {
+    const durationFromCore = core?.status?.duration;
+    if (typeof durationFromCore === "number" && durationFromCore > 0) {
+        return Math.floor(durationFromCore * 1000);
+    }
+    try {
+        const sizeOutput = await execWrapped("/usr/bin/stat", ["-f", "%z", wavPath], null, {silent: true});
+        const totalBytes = parseInt(sizeOutput.trim(), 10);
+        if (Number.isFinite(totalBytes) && totalBytes > WAV_HEADER_BYTES) {
+            const payloadBytes = totalBytes - WAV_HEADER_BYTES;
+            const samples = payloadBytes / PCM_BYTES_PER_SAMPLE;
+            const seconds = samples / SAMPLE_RATE;
+            return Math.floor(seconds * 1000);
+        }
+    } catch (error) {
+        console.warn(`Unable to inspect wav duration: ${error.message}`);
+    }
+    return null;
+}
+
+function parseSrtBlocks(content) {
+    if (!content) {
+        return [];
+    }
+    return content.split(/\r?\n\r?\n/).map(block => block.trim()).filter(Boolean).map(block => {
+        const lines = block.split(/\r?\n/).map(line => line.trimEnd());
+        if (lines.length < 2) {
+            return null;
+        }
+        let timingLineIndex = 0;
+        if (/^\d+$/.test(lines[0])) {
+            timingLineIndex = 1;
+        }
+        const timingLine = lines[timingLineIndex];
+        if (!isTimingLine(timingLine)) {
+            return null;
+        }
+        const textLines = lines.slice(timingLineIndex + 1);
+        return {timing: timingLine, text: textLines};
+    }).filter(Boolean);
+}
+
+function shiftSrtBlocks(blocks, offsetMs) {
+    if (!blocks || blocks.length === 0) {
+        return [];
+    }
+    return blocks.map(block => ({
+        timing: shiftTimingLine(block.timing, offsetMs),
+        text: block.text || [],
+    }));
+}
+
+function renderSegmentsToSrt(segments) {
+    if (!segments || segments.length === 0) {
+        return "";
+    }
+    const lines = [];
+    segments.forEach((segment, index) => {
+        lines.push(String(index + 1));
+        lines.push(segment.timing);
+        if (segment.text.length > 0) {
+            lines.push(...segment.text);
+        }
+        lines.push("");
+    });
+    return lines.join("\n");
+}
+
+function isTimingLine(line) {
+    return /^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}$/.test(line || "");
+}
+
+function shiftTimingLine(line, offsetMs) {
+    if (!isTimingLine(line) || !Number.isFinite(offsetMs) || offsetMs === 0) {
+        return line;
+    }
+    const [startRaw, endRaw] = line.split(/\s+-->\s+/);
+    const startMs = parseTimestampMs(startRaw);
+    const endMs = parseTimestampMs(endRaw);
+    return `${formatTimestamp(Math.max(0, startMs + offsetMs))} --> ${formatTimestamp(Math.max(0, endMs + offsetMs))}`;
+}
+
+function parseTimestampMs(value) {
+    const match = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(value || "");
+    if (!match) {
+        return 0;
+    }
+    const [, hh, mm, ss, ms] = match;
+    return (((parseInt(hh, 10) * 60 + parseInt(mm, 10)) * 60) + parseInt(ss, 10)) * 1000 + parseInt(ms, 10);
+}
+
+function formatTimestamp(ms) {
+    const clamped = Math.max(0, Math.floor(ms));
+    const hours = Math.floor(clamped / 3600000);
+    const minutes = Math.floor((clamped % 3600000) / 60000);
+    const seconds = Math.floor((clamped % 60000) / 1000);
+    const millis = clamped % 1000;
+    const pad = (num, len = 2) => String(num).padStart(len, "0");
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${pad(millis, 3)}`;
 }
 
 function resolveArchiveDirectory() {
