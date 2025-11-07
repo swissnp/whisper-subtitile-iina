@@ -22,6 +22,11 @@
   "preferenceDefaults": {
     "ffmpeg_path": "/opt/homebrew/bin/ffmpeg",
     "wcli_path": "/opt/homebrew/bin/whisper-cli",
+    "wserver_path": "/opt/homebrew/bin/whisper-server",
+    "wserver_host": "127.0.0.1",
+    "wserver_port": 17896,
+    "wserver_options": "",
+    "subtitle_archive_dir": "@data/subtitles",
     "show_tiny": true,
     "show_tiny_en": true,
     "show_base": true,

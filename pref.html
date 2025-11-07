@@ -81,6 +81,51 @@
 </div>
 
 <div class="pref-section">
+  Whisper.cpp Server Path:
+  <p class="small secondary pref-help">
+    Provide the absolute path to the <code>whisper-server</code> binary (built from <code>whisper.cpp</code>).
+  </p>
+  <div style="margin-top: 2px">
+    <input type="text" data-pref-key="wserver_path" style="width: 100%; margin-top: 2px" list="whisperServerPathList" />
+    <datalist id="whisperServerPathList">
+      <option value="/opt/homebrew/bin/whisper-server">
+      <option value="/usr/local/bin/whisper-server">
+    </datalist>
+  </div>
+</div>
+
+<div class="pref-section">
+  Whisper Server Connection:
+  <p class="small secondary pref-help">
+    Host/port where the plugin will connect to the server that is spawned automatically for each transcription.
+  </p>
+  <div style="display: flex; gap: 8px; margin-top: 2px">
+    <input type="text" data-pref-key="wserver_host" style="flex: 2" placeholder="127.0.0.1" />
+    <input type="number" data-pref-key="wserver_port" style="flex: 1" placeholder="17896" />
+  </div>
+</div>
+
+<div class="pref-section">
+  Extra Whisper Server Options:
+  <p class="small secondary pref-help">
+    These options will be passed to <code>whisper-server</code> directly.
+  </p>
+  <div style="margin-top: 2px">
+    <input type="text" data-pref-key="wserver_options" style="width: 100%; margin-top: 2px" />
+  </div>
+</div>
+
+<div class="pref-section">
+  Subtitle Archive Directory:
+  <p class="small secondary pref-help">
+    Subtitles will be copied here after each run so they can be reused later. Supports <code>@data</code>, <code>@tmp</code>, etc.
+  </p>
+  <div style="margin-top: 2px">
+    <input type="text" data-pref-key="subtitle_archive_dir" style="width: 100%; margin-top: 2px" placeholder="@data/subtitles" />
+  </div>
+</div>
+
+<div class="pref-section">
   <label>
     Activated models:
   </label>
