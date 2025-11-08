@@ -1,11 +1,22 @@
 import {listModels} from "./models";
-import {transcribe} from "./transcribe";
+import {transcribe, isOpenAIMode} from "./transcribe";
 
 const {subtitle, preferences, console} = iina;
 
 subtitle.registerProvider("whisper", {
     search: async () => {
         logCurrentSettings();
+        if (isOpenAIMode()) {
+            return [
+                subtitle.item({
+                    id: "openai",
+                    name: "OpenAI Streaming",
+                    size: "cloud",
+                    sha: "n/a",
+                    format: "srt",
+                }),
+            ];
+        }
         return listModels().map(model => subtitle.item({
             id: model.name, name: model.name, size: model.size, sha: model.sha, format: "srt",
         }));

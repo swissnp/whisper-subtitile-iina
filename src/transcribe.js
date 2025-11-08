@@ -16,7 +16,7 @@ const DEFAULT_OPENAI_AUDIO = {
 let activeServerInfo = null;
 
 export async function transcribe(model) {
-    const useOpenAI = shouldUseOpenAI();
+    const useOpenAI = isOpenAIMode();
     console.log(`[Whisperina] Selected backend: ${useOpenAI ? "OpenAI Streaming API" : "Local whisper.cpp server"}.`);
     if (!useOpenAI) {
         await downloadOrGetModel(model);
@@ -112,7 +112,7 @@ async function reloadSubtitleTrack(subtitlePath) {
     }
 }
 
-function shouldUseOpenAI() {
+export function isOpenAIMode() {
     const modeRaw = preferences.get("transcriber_mode");
     const mode = (modeRaw === undefined || modeRaw === null ? "whisper_server" : `${modeRaw}`).trim().toLowerCase();
     return mode === "openai";
