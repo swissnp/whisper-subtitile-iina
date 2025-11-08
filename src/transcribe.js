@@ -187,7 +187,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     const segmentMap = new Map();
     let writeChain = Promise.resolve();
     const rawEvents = [];
-    let rawDumpWritten = false;
+    let rawLogReported = false;
     let rawText = "";
 
     function nowIso() {
@@ -204,10 +204,9 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     }
 
     function writeRawDump() {
-        if (!rawResponsePath || rawDumpWritten) {
+        if (!rawResponsePath) {
             return;
         }
-        rawDumpWritten = true;
         try {
             const dump = {
                 generated_at: nowIso(),
@@ -215,7 +214,10 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
                 events: rawEvents,
             };
             file.write(rawResponsePath, JSON.stringify(dump, null, 2));
-            console.log(`[Whisperina][OpenAI] Saved raw streaming response to ${rawResponsePath}`);
+            if (!rawLogReported) {
+                rawLogReported = true;
+                console.log(`[Whisperina][OpenAI] Saved raw streaming response to ${rawResponsePath}`);
+            }
         } catch (error) {
             console.warn(`Failed to write raw OpenAI response: ${error.message}`);
         }
@@ -346,6 +348,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
 
     function scheduleFlush() {
         writeChain = writeChain.then(async () => {
+            writeRawDump();
             const rendered = renderSegmentsToSrt(segments);
             file.write(subtitlePath, rendered);
             await reloadSubtitleTrack(subtitlePath);
