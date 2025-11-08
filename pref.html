@@ -51,11 +51,15 @@
   <p class="small secondary pref-help">
     Choose whether to run transcriptions locally via whisper.cpp or use OpenAI’s cloud models (requires API key).
   </p>
-  <div style="margin-top: 2px">
-    <select data-pref-key="transcriber_mode" data-type="string" style="width: 100%; margin-top: 2px">
-      <option value="whisper_server">Local whisper.cpp server</option>
-      <option value="openai">OpenAI streaming API</option>
-    </select>
+  <div style="margin-top: 4px">
+    <label style="display: block; margin-bottom: 4px">
+      <input type="radio" name="transcriber_mode" data-pref-key="transcriber_mode" value="whisper_server" />
+      Local whisper.cpp server
+    </label>
+    <label style="display: block; margin-bottom: 4px">
+      <input type="radio" name="transcriber_mode" data-pref-key="transcriber_mode" value="openai" />
+      OpenAI streaming API
+    </label>
   </div>
 </div>
 
