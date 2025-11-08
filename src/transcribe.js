@@ -105,7 +105,9 @@ async function reloadSubtitleTrack(subtitlePath) {
 }
 
 function shouldUseOpenAI() {
-    return (preferences.get("transcriber_mode") || "whisper_server") === "openai";
+    const modeRaw = preferences.get("transcriber_mode");
+    const mode = (modeRaw === undefined || modeRaw === null ? "whisper_server" : `${modeRaw}`).trim().toLowerCase();
+    return mode === "openai";
 }
 
 async function prepareAudioForOpenAI(wavPath) {
