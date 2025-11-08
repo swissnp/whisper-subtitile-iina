@@ -30,7 +30,7 @@
     "transcriber_mode": "whisper_server",
     "openai_api_key": "",
     "openai_model": "gpt-4o-transcribe-diarize",
-    "openai_response_format": "json",
+    "openai_response_format": "diarized_json",
     "openai_chunking_strategy": "auto",
     "openai_base_url": "https://api.openai.com/v1/audio/transcriptions",
     "show_tiny": true,

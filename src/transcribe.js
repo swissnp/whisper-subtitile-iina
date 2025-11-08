@@ -193,7 +193,7 @@ async function executeOpenAIStreamingRequest(upload, handler) {
     }
     const baseUrl = (preferences.get("openai_base_url") || "https://api.openai.com/v1/audio/transcriptions").trim();
     const model = (preferences.get("openai_model") || "gpt-4o-transcribe-diarize").trim();
-    const responseFormat = (preferences.get("openai_response_format") || "json").trim();
+    const responseFormat = (preferences.get("openai_response_format") || "diarized_json").trim() || "diarized_json";
     const chunkingStrategy = (preferences.get("openai_chunking_strategy") || "").trim();
 
     console.log(`[Whisperina][OpenAI] Streaming request -> model=${model}, response_format=${responseFormat}, chunking=${chunkingStrategy || "default"}, endpoint=${baseUrl}`);
@@ -437,11 +437,13 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         const startMs = secondsToMs(segment.start ?? segment.start_time ?? 0);
         const endMs = secondsToMs(segment.end ?? segment.end_time ?? startMs + 2);
         const id = segment.id || `${startMs}-${endMs}-${text.length}`;
+        const speaker = typeof segment.speaker === "string" ? segment.speaker.trim() : null;
+        const formattedText = speaker ? `${speaker}: ${text}` : text;
         return {
             id,
             startMs,
             endMs,
-            textLines: splitTextIntoLines(text),
+            textLines: splitTextIntoLines(formattedText),
         };
     }
 
