@@ -188,6 +188,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     let writeChain = Promise.resolve();
     const rawEvents = [];
     let rawDumpWritten = false;
+    let rawText = "";
 
     function nowIso() {
         return new Date().toISOString();
@@ -210,6 +211,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         try {
             const dump = {
                 generated_at: nowIso(),
+                raw_text: rawText,
                 events: rawEvents,
             };
             file.write(rawResponsePath, JSON.stringify(dump, null, 2));
@@ -220,7 +222,12 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     }
 
     function handleChunk(data) {
-        buffer += data;
+        const chunk = coerceChunkToString(data);
+        if (!chunk) {
+            return;
+        }
+        rawText += chunk;
+        buffer += chunk;
         processBuffer();
     }
 
@@ -377,6 +384,38 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
                 console.log(`[Whisperina][OpenAI] Subtitle file flushed with ${segments.length} segment(s).`);
             },
         };
+}
+
+function coerceChunkToString(data) {
+    if (data === undefined || data === null) {
+        return "";
+    }
+    if (typeof data === "string") {
+        return data;
+    }
+    if (typeof data === "object") {
+        try {
+            if (typeof data.string === "function") {
+                const strValue = data.string();
+                if (typeof strValue === "string") {
+                    return strValue;
+                }
+            }
+            if (typeof data.toString === "function") {
+                const repr = data.toString();
+                if (typeof repr === "string" && repr !== "[object Object]") {
+                    return repr;
+                }
+            }
+            const json = JSON.stringify(data);
+            if (typeof json === "string") {
+                return json;
+            }
+        } catch (error) {
+            console.warn(`Failed to convert stream chunk to string: ${error.message}`);
+        }
+    }
+    return `${data}`;
 }
 
 function startLogMonitor(logPath, subtitlePath) {
