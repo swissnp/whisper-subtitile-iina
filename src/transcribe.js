@@ -17,6 +17,7 @@ let activeServerInfo = null;
 
 export async function transcribe(model) {
     const useOpenAI = shouldUseOpenAI();
+    console.log(`[Whisperina] Selected backend: ${useOpenAI ? "OpenAI Streaming API" : "Local whisper.cpp server"}.`);
     if (!useOpenAI) {
         await downloadOrGetModel(model);
     }
@@ -27,6 +28,7 @@ export async function transcribe(model) {
     const fileName = url.substring(7);
     core.osd("Generating temporary wave file...");
     const tempWavFile = await generateTemporaryWaveFiles(fileName);
+    console.log(`[Whisperina] Temporary WAV ready at ${tempWavFile}.`);
 
     core.osd(useOpenAI ? "Transcribing with OpenAI..." : "Transcribing...");
 
@@ -51,16 +53,19 @@ async function downloadOrGetModel(model) {
 
 async function generateTemporaryWaveFiles(fileName) {
     const tempWavFile = utils.resolvePath("@tmp/whisper_tmp.wav");
+    console.log(`[Whisperina] Running ffmpeg to produce intermediate WAV from ${fileName}.`);
     await execWrapped(getFfmpegPath(), ['-y', '-i', fileName, '-ar', '16000', '-ac', '1', "-c:a", "pcm_s16le", tempWavFile]);
     return tempWavFile;
 }
 
 async function transcribeWithWhisperServer(tempWavName, modelName, sourceMediaPath) {
+    console.log(`[Whisperina] Starting whisper.cpp transcription with model ${modelName}.`);
     const server = await startWhisperServer(modelName);
     const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
     try {
         await streamTranscription(server, tempWavName, subtitlePath);
         await persistSubtitleCopy(subtitlePath, sourceMediaPath);
+        console.log("[Whisperina] whisper.cpp transcription finished.");
         return subtitlePath;
     } finally {
         await stopWhisperServer(server);
@@ -68,6 +73,7 @@ async function transcribeWithWhisperServer(tempWavName, modelName, sourceMediaPa
 }
 
 async function transcribeWithOpenAI(tempWavName, sourceMediaPath) {
+    console.log("[Whisperina] Starting OpenAI streaming transcription.");
     const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
     const preparedAudio = await prepareAudioForOpenAI(tempWavName);
     const streamHandler = createOpenAIStreamHandler(subtitlePath);
@@ -75,6 +81,7 @@ async function transcribeWithOpenAI(tempWavName, sourceMediaPath) {
         await executeOpenAIStreamingRequest(preparedAudio, streamHandler);
         await streamHandler.waitForFlush();
         await persistSubtitleCopy(subtitlePath, sourceMediaPath);
+        console.log("[Whisperina] OpenAI transcription finished.");
         return subtitlePath;
     } finally {
         await streamHandler.waitForFlush().catch(() => {});
@@ -83,6 +90,7 @@ async function transcribeWithOpenAI(tempWavName, sourceMediaPath) {
 
 async function streamTranscription(serverInfo, wavPath, subtitlePath) {
     const monitor = startLogMonitor(serverInfo.logPath, subtitlePath);
+    console.log("[Whisperina] Streaming captions from whisper-server log output.");
     let transcriptionError = null;
     try {
         const finalSrt = await requestTranscriptionFromServer(serverInfo, wavPath);
@@ -112,12 +120,15 @@ function shouldUseOpenAI() {
 
 async function prepareAudioForOpenAI(wavPath) {
     const currentSize = await statFileSize(wavPath);
+    console.log(`[Whisperina][OpenAI] Source WAV size: ${(currentSize / (1024 * 1024)).toFixed(2)} MB.`);
     if (currentSize <= OPENAI_SIZE_LIMIT_BYTES) {
         return {path: wavPath, mime: "audio/wav"};
     }
     const outputPath = utils.resolvePath("@tmp/whisper_tmp_openai.mp3");
+    console.log("[Whisperina][OpenAI] WAV exceeds 25 MB, re-encoding to MP3.");
     await convertAudioWithFfmpeg(wavPath, outputPath, DEFAULT_OPENAI_AUDIO);
     const newSize = await statFileSize(outputPath);
+    console.log(`[Whisperina][OpenAI] Re-encoded MP3 size: ${(newSize / (1024 * 1024)).toFixed(2)} MB.`);
     if (newSize > OPENAI_SIZE_LIMIT_BYTES) {
         throw new Error("Audio file is still larger than 25 MB even after compression. Please trim the media or lower its quality.");
     }
@@ -146,6 +157,7 @@ async function executeOpenAIStreamingRequest(upload, handler) {
     const responseFormat = (preferences.get("openai_response_format") || "json").trim();
     const chunkingStrategy = (preferences.get("openai_chunking_strategy") || "").trim();
 
+    console.log(`[Whisperina][OpenAI] Streaming request -> model=${model}, response_format=${responseFormat}, chunking=${chunkingStrategy || "default"}, endpoint=${baseUrl}`);
     const args = [
         "curl",
         "-sN",
@@ -240,6 +252,7 @@ function createOpenAIStreamHandler(subtitlePath) {
             } else if (typeof event.text === "string") {
                 setTextOnly(event.text);
             }
+            console.log(`[Whisperina][OpenAI] Received final transcript with ${segments.length} segment(s).`);
         } else if (event.type === "transcript.text.delta" && typeof event.delta === "string") {
             setTextOnly(event.delta, {append: true});
         } else if (event.type === "response.error" && event.error) {
@@ -317,20 +330,22 @@ function createOpenAIStreamHandler(subtitlePath) {
         };
     }
 
-    return {
-        handleChunk,
-        handleError,
-        finalize,
-        async waitForFlush() {
-            await writeChain;
-        },
-    };
+        return {
+            handleChunk,
+            handleError,
+            finalize,
+            async waitForFlush() {
+                await writeChain;
+                console.log(`[Whisperina][OpenAI] Subtitle file flushed with ${segments.length} segment(s).`);
+            },
+        };
 }
 
 function startLogMonitor(logPath, subtitlePath) {
     const seen = new Set();
     const segments = [];
     let stopRequested = false;
+    console.log(`[Whisperina] Monitoring whisper-server log at ${logPath}.`);
     const loopPromise = (async () => {
         while (!stopRequested) {
             try {
@@ -369,6 +384,7 @@ function collectNewSegments(logPath, seen, segments) {
     }
     const lines = content.split(/\r?\n/);
     let updated = false;
+    let addedCount = 0;
     for (const rawLine of lines) {
         const line = rawLine.trim();
         if (!line) {
@@ -390,6 +406,10 @@ function collectNewSegments(logPath, seen, segments) {
             text: [text],
         });
         updated = true;
+        addedCount += 1;
+    }
+    if (updated) {
+        console.log(`[Whisperina] Added ${addedCount} new whisper-server segments (total=${segments.length}).`);
     }
     return updated;
 }
@@ -410,6 +430,7 @@ async function startWhisperServer(modelName) {
     const logPath = utils.resolvePath("@tmp/whisper_server.log");
     const args = ['-m', `${DATA}/ggml-${modelName}.bin`, '--host', host, '--port', `${port}`].concat(getServerOptions());
     const command = `${shellEscape(serverPath)} ${args.map(shellEscape).join(" ")} > ${shellEscape(logPath)} 2>&1 & echo $!`;
+    console.log(`[Whisperina] Launching whisper-server via: ${command}`);
     const stdout = await execWrapped("/bin/sh", ["-c", command], null, {silent: true});
     const pid = parseInt(stdout.trim().split("\n").pop() || "", 10);
     if (!Number.isFinite(pid)) {
@@ -420,6 +441,7 @@ async function startWhisperServer(modelName) {
     rememberServerPid(pid);
     try {
         await waitForServerReady(serverInfo.baseUrl);
+        console.log("[Whisperina] whisper-server reported healthy.");
     } catch (error) {
         console.error(`Failed to start whisper-server (log: ${logPath})`);
         await stopWhisperServer(serverInfo);
