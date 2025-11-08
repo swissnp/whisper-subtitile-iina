@@ -7,11 +7,43 @@ const SERVER_PID_FILE = "@tmp/whisper_server.pid";
 const LOG_POLL_INTERVAL_MS = 1000;
 const LOG_SEGMENT_REGEX = /^\[(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})]\s+(.*)$/;
 const OPENAI_SIZE_LIMIT_BYTES = 25 * 1024 * 1024;
-const DEFAULT_OPENAI_AUDIO = {
-    ext: "mp3",
-    mime: "audio/mpeg",
-    ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-b:a', '64k', '-f', 'mp3'],
-};
+const OPENAI_AUDIO_PROFILES = [
+    {
+        name: "aac_high",
+        ext: "m4a",
+        mime: "audio/mp4",
+        description: "AAC 96 kbps mono 16 kHz",
+        ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart'],
+    },
+    {
+        name: "aac_medium",
+        ext: "m4a",
+        mime: "audio/mp4",
+        description: "AAC 64 kbps mono 16 kHz",
+        ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-c:a', 'aac', '-b:a', '64k', '-movflags', '+faststart'],
+    },
+    {
+        name: "opus_voice",
+        ext: "webm",
+        mime: "audio/webm",
+        description: "Opus 48 kbps mono 16 kHz",
+        ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-c:a', 'libopus', '-b:a', '48k', '-vbr', 'on'],
+    },
+    {
+        name: "mp3_speech",
+        ext: "mp3",
+        mime: "audio/mpeg",
+        description: "MP3 64 kbps mono 16 kHz",
+        ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-b:a', '64k', '-f', 'mp3'],
+    },
+    {
+        name: "mp3_low",
+        ext: "mp3",
+        mime: "audio/mpeg",
+        description: "MP3 48 kbps mono 16 kHz",
+        ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-b:a', '48k', '-f', 'mp3'],
+    },
+];
 
 let activeServerInfo = null;
 
@@ -125,15 +157,21 @@ async function prepareAudioForOpenAI(wavPath) {
     if (currentSize <= OPENAI_SIZE_LIMIT_BYTES) {
         return {path: wavPath, mime: "audio/wav"};
     }
-    const outputPath = utils.resolvePath("@tmp/whisper_tmp_openai.mp3");
-    console.log("[Whisperina][OpenAI] WAV exceeds 25 MB, re-encoding to MP3.");
-    await convertAudioWithFfmpeg(wavPath, outputPath, DEFAULT_OPENAI_AUDIO);
-    const newSize = await statFileSize(outputPath);
-    console.log(`[Whisperina][OpenAI] Re-encoded MP3 size: ${(newSize / (1024 * 1024)).toFixed(2)} MB.`);
-    if (newSize > OPENAI_SIZE_LIMIT_BYTES) {
-        throw new Error("Audio file is still larger than 25 MB even after compression. Please trim the media or lower its quality.");
+
+    for (const profile of OPENAI_AUDIO_PROFILES) {
+        const outputPath = utils.resolvePath(`@tmp/whisper_tmp_openai.${profile.ext}`);
+        console.log(`[Whisperina][OpenAI] WAV exceeds 25 MB, re-encoding using ${profile.description}.`);
+        await convertAudioWithFfmpeg(wavPath, outputPath, profile);
+        const newSize = await statFileSize(outputPath);
+        console.log(`[Whisperina][OpenAI] ${profile.ext.toUpperCase()} size: ${(newSize / (1024 * 1024)).toFixed(2)} MB.`);
+        if (newSize <= OPENAI_SIZE_LIMIT_BYTES) {
+            console.log(`[Whisperina][OpenAI] Selected ${profile.description} for upload.`);
+            return {path: outputPath, mime: profile.mime};
+        }
+        console.log(`[Whisperina][OpenAI] ${profile.description} still exceeds 25 MB, trying next profile...`);
     }
-    return {path: outputPath, mime: DEFAULT_OPENAI_AUDIO.mime};
+
+    throw new Error("Audio file is still larger than 25 MB even after trying high-compression profiles. Please trim the media or lower its quality.");
 }
 
 async function statFileSize(path) {
