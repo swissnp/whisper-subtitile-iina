@@ -47,6 +47,19 @@
 
 <body>
 <div class="pref-section">
+  Transcription Backend:
+  <p class="small secondary pref-help">
+    Choose whether to run transcriptions locally via whisper.cpp or use OpenAI’s cloud models (requires API key).
+  </p>
+  <div style="margin-top: 2px">
+    <select data-pref-key="transcriber_mode" style="width: 100%; margin-top: 2px">
+      <option value="whisper_server">Local whisper.cpp server</option>
+      <option value="openai">OpenAI streaming API</option>
+    </select>
+  </div>
+</div>
+
+<div class="pref-section">
   FFmpeg CLI Path:
   <p class="small secondary pref-help">
     Provide the absolute path to the <code>ffmpeg</code> binary. You may run <code>brew install ffmpeg</code> to install it.
@@ -123,6 +136,41 @@
   <div style="margin-top: 2px">
     <input type="text" data-pref-key="subtitle_archive_dir" style="width: 100%; margin-top: 2px" placeholder="@data/subtitles" />
   </div>
+</div>
+
+<div class="pref-section">
+  OpenAI API Key:
+  <p class="small secondary pref-help">
+    Required when using the OpenAI backend. The key is stored locally inside IINA’s preferences.
+  </p>
+  <div style="margin-top: 2px">
+    <input type="password" data-pref-key="openai_api_key" style="width: 100%; margin-top: 2px" placeholder="sk-..." />
+  </div>
+</div>
+
+<div class="pref-section">
+  OpenAI Model &amp; Options:
+  <p class="small secondary pref-help">
+    Streaming with timestamps requires <code>gpt-4o-transcribe-diarize</code> and <code>chunking_strategy=auto</code>.
+  </p>
+  <div style="margin-top: 2px">
+    <input type="text" data-pref-key="openai_model" style="width: 100%; margin-top: 2px" placeholder="gpt-4o-transcribe-diarize" />
+  </div>
+  <div style="margin-top: 6px">
+    <label class="small">Response format</label>
+    <input type="text" data-pref-key="openai_response_format" style="width: 100%; margin-top: 2px" placeholder="json" />
+  </div>
+  <div style="margin-top: 6px">
+    <label class="small">Chunking strategy</label>
+    <input type="text" data-pref-key="openai_chunking_strategy" style="width: 100%; margin-top: 2px" placeholder="auto" />
+  </div>
+  <div style="margin-top: 6px">
+    <label class="small">API endpoint</label>
+    <input type="text" data-pref-key="openai_base_url" style="width: 100%; margin-top: 2px" placeholder="https://api.openai.com/v1/audio/transcriptions" />
+  </div>
+  <p class="small secondary pref-help">
+    Audio uploads must be under 25&nbsp;MB; the plugin will re-encode to a low bitrate MP3 automatically when necessary.
+  </p>
 </div>
 
 <div class="pref-section">

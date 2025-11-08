@@ -6,11 +6,20 @@ const HOME_PATH = '~/Library/Application Support/com.colliderli.iina/plugins/';
 const SERVER_PID_FILE = "@tmp/whisper_server.pid";
 const LOG_POLL_INTERVAL_MS = 1000;
 const LOG_SEGMENT_REGEX = /^\[(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})]\s+(.*)$/;
+const OPENAI_SIZE_LIMIT_BYTES = 25 * 1024 * 1024;
+const DEFAULT_OPENAI_AUDIO = {
+    ext: "mp3",
+    mime: "audio/mpeg",
+    ffmpegArgs: ['-vn', '-ar', '16000', '-ac', '1', '-b:a', '64k', '-f', 'mp3'],
+};
 
 let activeServerInfo = null;
 
 export async function transcribe(model) {
-    await downloadOrGetModel(model);
+    const useOpenAI = shouldUseOpenAI();
+    if (!useOpenAI) {
+        await downloadOrGetModel(model);
+    }
     const url = core.status.url;
     if (!url.startsWith("file://")) {
         throw new Error(`Subtitle generation doesn't work with non-local file ${url}.`);
@@ -19,8 +28,11 @@ export async function transcribe(model) {
     core.osd("Generating temporary wave file...");
     const tempWavFile = await generateTemporaryWaveFiles(fileName);
 
-    core.osd("Transcribing...");
-    const subtitlePath = await transcribeAudio(tempWavFile, model, fileName);
+    core.osd(useOpenAI ? "Transcribing with OpenAI..." : "Transcribing...");
+
+    const subtitlePath = useOpenAI
+        ? await transcribeWithOpenAI(tempWavFile, fileName)
+        : await transcribeWithWhisperServer(tempWavFile, model, fileName);
 
     core.osd("Transcription succeeded.");
     return [subtitlePath];
@@ -43,7 +55,7 @@ async function generateTemporaryWaveFiles(fileName) {
     return tempWavFile;
 }
 
-async function transcribeAudio(tempWavName, modelName, sourceMediaPath) {
+async function transcribeWithWhisperServer(tempWavName, modelName, sourceMediaPath) {
     const server = await startWhisperServer(modelName);
     const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
     try {
@@ -52,6 +64,20 @@ async function transcribeAudio(tempWavName, modelName, sourceMediaPath) {
         return subtitlePath;
     } finally {
         await stopWhisperServer(server);
+    }
+}
+
+async function transcribeWithOpenAI(tempWavName, sourceMediaPath) {
+    const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
+    const preparedAudio = await prepareAudioForOpenAI(tempWavName);
+    const streamHandler = createOpenAIStreamHandler(subtitlePath);
+    try {
+        await executeOpenAIStreamingRequest(preparedAudio, streamHandler);
+        await streamHandler.waitForFlush();
+        await persistSubtitleCopy(subtitlePath, sourceMediaPath);
+        return subtitlePath;
+    } finally {
+        await streamHandler.waitForFlush().catch(() => {});
     }
 }
 
@@ -76,6 +102,227 @@ async function reloadSubtitleTrack(subtitlePath) {
     } catch (error) {
         console.warn(`Failed to reload subtitle track: ${error.message}`);
     }
+}
+
+function shouldUseOpenAI() {
+    return (preferences.get("transcriber_mode") || "whisper_server") === "openai";
+}
+
+async function prepareAudioForOpenAI(wavPath) {
+    const currentSize = await statFileSize(wavPath);
+    if (currentSize <= OPENAI_SIZE_LIMIT_BYTES) {
+        return {path: wavPath, mime: "audio/wav"};
+    }
+    const outputPath = utils.resolvePath("@tmp/whisper_tmp_openai.mp3");
+    await convertAudioWithFfmpeg(wavPath, outputPath, DEFAULT_OPENAI_AUDIO);
+    const newSize = await statFileSize(outputPath);
+    if (newSize > OPENAI_SIZE_LIMIT_BYTES) {
+        throw new Error("Audio file is still larger than 25 MB even after compression. Please trim the media or lower its quality.");
+    }
+    return {path: outputPath, mime: DEFAULT_OPENAI_AUDIO.mime};
+}
+
+async function statFileSize(path) {
+    const output = await execWrapped("/usr/bin/stat", ["-f", "%z", path], null, {silent: true});
+    const size = parseInt(output.trim(), 10);
+    return Number.isFinite(size) ? size : 0;
+}
+
+async function convertAudioWithFfmpeg(inputPath, outputPath, codecOptions) {
+    const args = ['-y', '-i', inputPath].concat(codecOptions.ffmpegArgs || []).concat([outputPath]);
+    await execWrapped(getFfmpegPath(), args);
+    return outputPath;
+}
+
+async function executeOpenAIStreamingRequest(upload, handler) {
+    const apiKey = (preferences.get("openai_api_key") || "").trim();
+    if (!apiKey) {
+        throw new Error("OpenAI API key is not configured. Please update the preferences page.");
+    }
+    const baseUrl = (preferences.get("openai_base_url") || "https://api.openai.com/v1/audio/transcriptions").trim();
+    const model = (preferences.get("openai_model") || "gpt-4o-transcribe-diarize").trim();
+    const responseFormat = (preferences.get("openai_response_format") || "json").trim();
+    const chunkingStrategy = (preferences.get("openai_chunking_strategy") || "").trim();
+
+    const args = [
+        "curl",
+        "-sN",
+        "-X", "POST",
+        baseUrl,
+        "-H", `Authorization: Bearer ${apiKey}`,
+        "-H", "Accept: text/event-stream",
+        "-F", `file=@${upload.path}`,
+        "-F", `model=${model}`,
+        "-F", `response_format=${responseFormat}`,
+        "-F", "stream=true",
+    ];
+    if (chunkingStrategy) {
+        args.push("-F", `chunking_strategy=${chunkingStrategy}`);
+    }
+    const result = await utils.exec("/usr/bin/env", args, null, handler.handleChunk, handler.handleError);
+    handler.finalize();
+    if (result.status !== 0) {
+        throw new Error(`OpenAI streaming request failed (status ${result.status}). Check your API key, quota, or model settings.`);
+    }
+}
+
+function createOpenAIStreamHandler(subtitlePath) {
+    let buffer = "";
+    const segments = [];
+    const segmentMap = new Map();
+    let writeChain = Promise.resolve();
+
+    function handleChunk(data) {
+        buffer += data;
+        processBuffer();
+    }
+
+    function handleError(data) {
+        if (data && data.trim().length > 0) {
+            console.warn(`OpenAI stream stderr: ${data}`);
+        }
+    }
+
+    function finalize() {
+        processBuffer(true);
+    }
+
+    function processBuffer(force = false) {
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            processLine(line);
+        }
+        if (force && buffer.trim().length > 0) {
+            processLine(buffer.trim());
+            buffer = "";
+        }
+    }
+
+    function processLine(line) {
+        if (!line || line.startsWith(":")) {
+            return;
+        }
+        if (!line.startsWith("data:")) {
+            return;
+        }
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") {
+            return;
+        }
+        let event;
+        try {
+            event = JSON.parse(payload);
+        } catch (error) {
+            console.warn(`Unable to parse OpenAI SSE payload: ${error.message}`);
+            return;
+        }
+        handleEvent(event);
+    }
+
+    function handleEvent(event) {
+        if (!event || typeof event !== "object") {
+            return;
+        }
+        if (event.type === "transcript.text.segment" && event.segment) {
+            if (upsertSegment(event.segment)) {
+                scheduleFlush();
+            }
+        } else if (event.type === "transcript.text.done") {
+            if (Array.isArray(event.segments) && event.segments.length > 0) {
+                segments.length = 0;
+                segmentMap.clear();
+                event.segments.forEach(segment => upsertSegment(segment, {skipFlush: true}));
+                scheduleFlush();
+            } else if (typeof event.text === "string") {
+                setTextOnly(event.text);
+            }
+        } else if (event.type === "transcript.text.delta" && typeof event.delta === "string") {
+            setTextOnly(event.delta, {append: true});
+        } else if (event.type === "response.error" && event.error) {
+            console.error(`OpenAI response error: ${event.error.message || "unknown error"}`);
+        }
+    }
+
+    function upsertSegment(rawSegment, options = {}) {
+        const normalized = normalizeOpenAISegment(rawSegment);
+        if (!normalized) {
+            return false;
+        }
+        const existingIndex = segmentMap.has(normalized.id) ? segmentMap.get(normalized.id) : -1;
+        if (existingIndex >= 0) {
+            segments[existingIndex] = normalized;
+        } else {
+            segmentMap.set(normalized.id, segments.length);
+            segments.push(normalized);
+            segments.sort((a, b) => a.startMs - b.startMs);
+            segments.forEach((segment, index) => segmentMap.set(segment.id, index));
+        }
+        if (!options.skipFlush) {
+            scheduleFlush();
+        }
+        return true;
+    }
+
+    function setTextOnly(text, options = {}) {
+        const content = (options.append && segments.length > 0)
+            ? `${segments[segments.length - 1].textLines.join(" ")} ${text}`.trim()
+            : (text || "").trim();
+        if (!content) {
+            return;
+        }
+        const estimatedDuration = getMediaDurationMs() || estimateDurationFromText(content);
+        segments.length = 0;
+        segmentMap.clear();
+        segments.push({
+            id: "text-only",
+            startMs: 0,
+            endMs: estimatedDuration,
+            textLines: splitTextIntoLines(content),
+        });
+        segmentMap.set("text-only", 0);
+        scheduleFlush();
+    }
+
+    function scheduleFlush() {
+        writeChain = writeChain.then(async () => {
+            const rendered = renderSegmentsToSrt(segments);
+            file.write(subtitlePath, rendered);
+            await reloadSubtitleTrack(subtitlePath);
+        }).catch(error => {
+            console.warn(`Failed to update streaming subtitles: ${error.message}`);
+        });
+        return writeChain;
+    }
+
+    function normalizeOpenAISegment(segment) {
+        if (!segment) {
+            return null;
+        }
+        const text = (segment.text || "").trim();
+        if (!text) {
+            return null;
+        }
+        const startMs = secondsToMs(segment.start ?? segment.start_time ?? 0);
+        const endMs = secondsToMs(segment.end ?? segment.end_time ?? startMs + 2);
+        const id = segment.id || `${startMs}-${endMs}-${text.length}`;
+        return {
+            id,
+            startMs,
+            endMs,
+            textLines: splitTextIntoLines(text),
+        };
+    }
+
+    return {
+        handleChunk,
+        handleError,
+        finalize,
+        async waitForFlush() {
+            await writeChain;
+        },
+    };
 }
 
 function startLogMonitor(logPath, subtitlePath) {
@@ -346,16 +593,46 @@ function renderSegmentsToSrt(segments) {
     if (!segments || segments.length === 0) {
         return "";
     }
+    const normalized = segments.map(normalizeRenderableSegment).filter(Boolean);
+    if (normalized.length === 0) {
+        return "";
+    }
+    normalized.sort((a, b) => a.startMs - b.startMs);
     const lines = [];
-    segments.forEach((segment, index) => {
+    normalized.forEach((segment, index) => {
         lines.push(String(index + 1));
-        lines.push(segment.timing);
-        if (segment.text.length > 0) {
-            lines.push(...segment.text);
-        }
+        lines.push(`${formatTimestamp(segment.startMs)} --> ${formatTimestamp(segment.endMs)}`);
+        segment.textLines.forEach(textLine => lines.push(textLine));
         lines.push("");
     });
     return lines.join("\n");
+}
+
+function normalizeRenderableSegment(segment) {
+    if (!segment) {
+        return null;
+    }
+    if (segment.timing) {
+        const [startRaw, endRaw] = segment.timing.split(/\s+-->\s+/);
+        return {
+            startMs: parseTimestampMs(startRaw),
+            endMs: parseTimestampMs(endRaw),
+            textLines: Array.isArray(segment.text) ? segment.text : Array.isArray(segment.textLines) ? segment.textLines : [segment.text || ""],
+        };
+    }
+    const startMs = typeof segment.startMs === "number" ? segment.startMs : 0;
+    const endMsCandidates = [
+        segment.endMs,
+        startMs + estimateDurationFromTextLines(segment.textLines || segment.text || []),
+    ].filter(value => typeof value === "number" && value > startMs);
+    const endMs = endMsCandidates.length > 0 ? Math.max(...endMsCandidates) : startMs + 2000;
+    const textLines = Array.isArray(segment.textLines)
+        ? segment.textLines
+        : Array.isArray(segment.text)
+            ? segment.text
+            : [segment.text || ""];
+    const filtered = textLines.filter(line => typeof line === "string" ? line.trim().length > 0 : false);
+    return {startMs, endMs, textLines: filtered.length > 0 ? filtered : [""]};
 }
 
 function resolveArchiveDirectory() {
@@ -415,6 +692,61 @@ function parseArgumentList(rawValue) {
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getMediaDurationMs() {
+    const duration = core?.status?.duration;
+    if (typeof duration === "number" && duration > 0) {
+        return Math.floor(duration * 1000);
+    }
+    return null;
+}
+
+function estimateDurationFromText(text) {
+    const words = (text || "").trim().split(/\s+/).filter(Boolean).length;
+    const averageMsPerWord = 320; // ~187 wpm
+    return words > 0 ? words * averageMsPerWord : 4000;
+}
+
+function estimateDurationFromTextLines(lines) {
+    if (!lines || lines.length === 0) {
+        return 2000;
+    }
+    const joined = Array.isArray(lines) ? lines.join(" ") : String(lines);
+    return estimateDurationFromText(joined);
+}
+
+function splitTextIntoLines(text) {
+    if (!text) {
+        return [];
+    }
+    return text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+}
+
+function secondsToMs(value) {
+    if (typeof value !== "number" || Number.isNaN(value)) {
+        return 0;
+    }
+    return Math.max(0, Math.round(value * 1000));
+}
+
+function parseTimestampMs(value) {
+    const match = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(value || "");
+    if (!match) {
+        return 0;
+    }
+    const [, hh, mm, ss, ms] = match;
+    return ((((parseInt(hh, 10) * 60) + parseInt(mm, 10)) * 60) + parseInt(ss, 10)) * 1000 + parseInt(ms, 10);
+}
+
+function formatTimestamp(ms) {
+    const clamped = Math.max(0, Math.floor(ms));
+    const hours = Math.floor(clamped / 3600000);
+    const minutes = Math.floor((clamped % 3600000) / 60000);
+    const seconds = Math.floor((clamped % 60000) / 1000);
+    const millis = clamped % 1000;
+    const pad = (num, len = 2) => String(num).padStart(len, "0");
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${pad(millis, 3)}`;
 }
 
 async function execWrapped(file, commands, cwd, options = {}) {
