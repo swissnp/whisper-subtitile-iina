@@ -3,10 +3,11 @@ import {parse} from "shell-quote";
 const {console, core, preferences, utils, http, file} = iina;
 
 const HOME_PATH = '~/Library/Application Support/com.colliderli.iina/plugins/';
-const STREAM_CHUNK_SECONDS = 10;
-const SAMPLE_RATE = 16000;
-const PCM_BYTES_PER_SAMPLE = 2;
-const WAV_HEADER_BYTES = 44;
+const SERVER_PID_FILE = "@tmp/whisper_server.pid";
+const LOG_POLL_INTERVAL_MS = 1000;
+const LOG_SEGMENT_REGEX = /^\[(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})]\s+(.*)$/;
+
+let activeServerInfo = null;
 
 export async function transcribe(model) {
     await downloadOrGetModel(model);
@@ -55,56 +56,18 @@ async function transcribeAudio(tempWavName, modelName, sourceMediaPath) {
 }
 
 async function streamTranscription(serverInfo, wavPath, subtitlePath) {
-    const aggregatedSegments = [];
-    const totalDurationMs = await estimateAudioDurationMs(wavPath);
-    if (!totalDurationMs || totalDurationMs <= STREAM_CHUNK_SECONDS * 1000) {
-        const srtContent = await requestTranscriptionFromServer(serverInfo, wavPath);
-        aggregatedSegments.push(...shiftSrtBlocks(parseSrtBlocks(srtContent), 0));
-        const rendered = renderSegmentsToSrt(aggregatedSegments);
-        file.write(subtitlePath, rendered);
-        await reloadSubtitleTrack(subtitlePath);
-        return;
+    const monitor = startLogMonitor(serverInfo.logPath, subtitlePath);
+    let transcriptionError = null;
+    try {
+        const finalSrt = await requestTranscriptionFromServer(serverInfo, wavPath);
+        await monitor.finalize(finalSrt);
+    } catch (error) {
+        transcriptionError = error;
+        await monitor.finalize(null);
     }
-    let processedMs = 0;
-    let chunkIndex = 0;
-    while (processedMs < totalDurationMs) {
-        const remainingMs = totalDurationMs - processedMs;
-        const chunkDurationMs = Math.min(STREAM_CHUNK_SECONDS * 1000, remainingMs);
-        const chunkPath = utils.resolvePath(`@tmp/whisper_chunk_${chunkIndex}.wav`);
-        try {
-            await extractAudioChunk(wavPath, chunkPath, processedMs, chunkDurationMs);
-            const chunkSrt = await requestTranscriptionFromServer(serverInfo, chunkPath);
-            aggregatedSegments.push(...shiftSrtBlocks(parseSrtBlocks(chunkSrt), processedMs));
-            const rendered = renderSegmentsToSrt(aggregatedSegments);
-            file.write(subtitlePath, rendered);
-            await reloadSubtitleTrack(subtitlePath);
-            processedMs += chunkDurationMs;
-            chunkIndex += 1;
-        } finally {
-            await removeFileQuietly(chunkPath);
-        }
+    if (transcriptionError) {
+        throw transcriptionError;
     }
-}
-
-async function extractAudioChunk(sourcePath, outputPath, startMs, durationMs) {
-    const startSeconds = (startMs / 1000).toFixed(3);
-    const durationSeconds = (durationMs / 1000).toFixed(3);
-    await execWrapped(getFfmpegPath(), [
-        '-y',
-        '-ss',
-        startSeconds,
-        '-t',
-        durationSeconds,
-        '-i',
-        sourcePath,
-        '-ar',
-        `${SAMPLE_RATE}`,
-        '-ac',
-        '1',
-        '-c:a',
-        'pcm_s16le',
-        outputPath,
-    ]);
 }
 
 async function reloadSubtitleTrack(subtitlePath) {
@@ -115,12 +78,80 @@ async function reloadSubtitleTrack(subtitlePath) {
     }
 }
 
-async function removeFileQuietly(path) {
-    try {
-        await utils.exec("/bin/rm", ["-f", path]);
-    } catch (error) {
-        console.warn(`Unable to remove temp file ${path}: ${error.message}`);
+function startLogMonitor(logPath, subtitlePath) {
+    const seen = new Set();
+    const segments = [];
+    let stopRequested = false;
+    const loopPromise = (async () => {
+        while (!stopRequested) {
+            try {
+                const updated = collectNewSegments(logPath, seen, segments);
+                if (updated) {
+                    const rendered = renderSegmentsToSrt(segments);
+                    file.write(subtitlePath, rendered);
+                    await reloadSubtitleTrack(subtitlePath);
+                }
+            } catch (error) {
+                console.warn(`Log monitor error: ${error.message}`);
+            }
+            await sleep(LOG_POLL_INTERVAL_MS);
+        }
+    })();
+
+    return {
+        async finalize(finalSrt) {
+            stopRequested = true;
+            await loopPromise;
+            if (finalSrt) {
+                file.write(subtitlePath, finalSrt);
+                await reloadSubtitleTrack(subtitlePath);
+            }
+        },
+    };
+}
+
+function collectNewSegments(logPath, seen, segments) {
+    if (!logPath || !file.exists(logPath)) {
+        return false;
     }
+    const content = file.read(logPath) || "";
+    if (!content) {
+        return false;
+    }
+    const lines = content.split(/\r?\n/);
+    let updated = false;
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) {
+            continue;
+        }
+        const match = LOG_SEGMENT_REGEX.exec(line);
+        if (!match) {
+            continue;
+        }
+        const [, start, end, textRaw] = match;
+        const text = textRaw.trim();
+        const key = `${start}|${end}|${text}`;
+        if (seen.has(key)) {
+            continue;
+        }
+        seen.add(key);
+        segments.push({
+            timing: `${convertLogTimestamp(start)} --> ${convertLogTimestamp(end)}`,
+            text: [text],
+        });
+        updated = true;
+    }
+    return updated;
+}
+
+function convertLogTimestamp(value) {
+    if (!value) {
+        return "00:00:00,000";
+    }
+    const [whole = "", fractional = "000"] = value.split(".");
+    const frac = (fractional + "000").slice(0, 3);
+    return `${whole},${frac}`;
 }
 
 async function startWhisperServer(modelName) {
@@ -136,6 +167,8 @@ async function startWhisperServer(modelName) {
         throw new Error("Unable to start whisper-server. Check your server path and options.");
     }
     const serverInfo = {pid, host, port, baseUrl: `http://${host}:${port}`, logPath};
+    activeServerInfo = serverInfo;
+    rememberServerPid(pid);
     try {
         await waitForServerReady(serverInfo.baseUrl);
     } catch (error) {
@@ -184,14 +217,32 @@ async function requestTranscriptionFromServer(serverInfo, wavPath) {
 }
 
 async function stopWhisperServer(serverInfo) {
-    if (!serverInfo || !serverInfo.pid) {
+    const info = serverInfo || activeServerInfo;
+    const recordedPid = readRecordedServerPid();
+    const pid = info?.pid || recordedPid;
+    if (!pid) {
+        clearRecordedServerPid();
         return;
     }
     try {
-        await utils.exec("/bin/kill", ["-TERM", `${serverInfo.pid}`]);
+        await utils.exec("/bin/kill", ["-TERM", `${pid}`]);
+        await sleep(200);
     } catch (error) {
-        console.warn(`Failed to stop whisper-server (pid ${serverInfo.pid}): ${error.message}`);
+        if (!/No such process/i.test(error?.message || "")) {
+            console.warn(`Failed to terminate whisper-server (pid ${pid}): ${error.message}`);
+        }
     }
+    try {
+        await utils.exec("/bin/kill", ["-KILL", `${pid}`]);
+    } catch (error) {
+        if (!/No such process/i.test(error?.message || "")) {
+            console.warn(`Failed to force-stop whisper-server (pid ${pid}): ${error.message}`);
+        }
+    }
+    if (activeServerInfo && activeServerInfo.pid === pid) {
+        activeServerInfo = null;
+    }
+    clearRecordedServerPid();
 }
 
 async function persistSubtitleCopy(subtitlePath, mediaFile) {
@@ -238,56 +289,57 @@ function getPluginDataPath() {
     return utils.resolvePath("@data/")
 }
 
-async function estimateAudioDurationMs(wavPath) {
-    const durationFromCore = core?.status?.duration;
-    if (typeof durationFromCore === "number" && durationFromCore > 0) {
-        return Math.floor(durationFromCore * 1000);
+function getServerPidPath() {
+    try {
+        return utils.resolvePath(SERVER_PID_FILE);
+    } catch (error) {
+        console.warn(`Unable to resolve server PID file: ${error.message}`);
+        return null;
+    }
+}
+
+function rememberServerPid(pid) {
+    const pidPath = getServerPidPath();
+    if (!pidPath) {
+        return;
     }
     try {
-        const sizeOutput = await execWrapped("/usr/bin/stat", ["-f", "%z", wavPath], null, {silent: true});
-        const totalBytes = parseInt(sizeOutput.trim(), 10);
-        if (Number.isFinite(totalBytes) && totalBytes > WAV_HEADER_BYTES) {
-            const payloadBytes = totalBytes - WAV_HEADER_BYTES;
-            const samples = payloadBytes / PCM_BYTES_PER_SAMPLE;
-            const seconds = samples / SAMPLE_RATE;
-            return Math.floor(seconds * 1000);
+        file.write(pidPath, `${pid}`);
+    } catch (error) {
+        console.warn(`Unable to record whisper-server pid: ${error.message}`);
+    }
+}
+
+function clearRecordedServerPid() {
+    const pidPath = getServerPidPath();
+    if (!pidPath) {
+        return;
+    }
+    try {
+        if (file.exists(pidPath)) {
+            file.delete(pidPath);
         }
     } catch (error) {
-        console.warn(`Unable to inspect wav duration: ${error.message}`);
+        console.warn(`Unable to remove PID record: ${error.message}`);
     }
-    return null;
 }
 
-function parseSrtBlocks(content) {
-    if (!content) {
-        return [];
+function readRecordedServerPid() {
+    const pidPath = getServerPidPath();
+    if (!pidPath) {
+        return null;
     }
-    return content.split(/\r?\n\r?\n/).map(block => block.trim()).filter(Boolean).map(block => {
-        const lines = block.split(/\r?\n/).map(line => line.trimEnd());
-        if (lines.length < 2) {
+    try {
+        if (!file.exists(pidPath)) {
             return null;
         }
-        let timingLineIndex = 0;
-        if (/^\d+$/.test(lines[0])) {
-            timingLineIndex = 1;
-        }
-        const timingLine = lines[timingLineIndex];
-        if (!isTimingLine(timingLine)) {
-            return null;
-        }
-        const textLines = lines.slice(timingLineIndex + 1);
-        return {timing: timingLine, text: textLines};
-    }).filter(Boolean);
-}
-
-function shiftSrtBlocks(blocks, offsetMs) {
-    if (!blocks || blocks.length === 0) {
-        return [];
+        const content = file.read(pidPath);
+        const pid = parseInt((content || "").trim(), 10);
+        return Number.isFinite(pid) ? pid : null;
+    } catch (error) {
+        console.warn(`Unable to read PID record: ${error.message}`);
+        return null;
     }
-    return blocks.map(block => ({
-        timing: shiftTimingLine(block.timing, offsetMs),
-        text: block.text || [],
-    }));
 }
 
 function renderSegmentsToSrt(segments) {
@@ -304,39 +356,6 @@ function renderSegmentsToSrt(segments) {
         lines.push("");
     });
     return lines.join("\n");
-}
-
-function isTimingLine(line) {
-    return /^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}$/.test(line || "");
-}
-
-function shiftTimingLine(line, offsetMs) {
-    if (!isTimingLine(line) || !Number.isFinite(offsetMs) || offsetMs === 0) {
-        return line;
-    }
-    const [startRaw, endRaw] = line.split(/\s+-->\s+/);
-    const startMs = parseTimestampMs(startRaw);
-    const endMs = parseTimestampMs(endRaw);
-    return `${formatTimestamp(Math.max(0, startMs + offsetMs))} --> ${formatTimestamp(Math.max(0, endMs + offsetMs))}`;
-}
-
-function parseTimestampMs(value) {
-    const match = /^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/.exec(value || "");
-    if (!match) {
-        return 0;
-    }
-    const [, hh, mm, ss, ms] = match;
-    return (((parseInt(hh, 10) * 60 + parseInt(mm, 10)) * 60) + parseInt(ss, 10)) * 1000 + parseInt(ms, 10);
-}
-
-function formatTimestamp(ms) {
-    const clamped = Math.max(0, Math.floor(ms));
-    const hours = Math.floor(clamped / 3600000);
-    const minutes = Math.floor((clamped % 3600000) / 60000);
-    const seconds = Math.floor((clamped % 60000) / 1000);
-    const millis = clamped % 1000;
-    const pad = (num, len = 2) => String(num).padStart(len, "0");
-    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)},${pad(millis, 3)}`;
 }
 
 function resolveArchiveDirectory() {
