@@ -223,10 +223,13 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     let buffer = "";
     const segments = [];
     const segmentMap = new Map();
-    let writeChain = Promise.resolve();
+    let flushChain = Promise.resolve();
+    let flushTimer = null;
+    let pendingFlush = false;
     const rawEvents = [];
     let rawLogReported = false;
     let rawText = "";
+    const FLUSH_INTERVAL_MS = 5000;
 
     function nowIso() {
         return new Date().toISOString();
@@ -279,7 +282,9 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
 
     function finalize() {
         processBuffer(true);
-        writeRawDump();
+        flushNow().catch(error => {
+            console.warn(`Failed to flush subtitles during finalize: ${error.message}`);
+        });
     }
 
     function processBuffer(force = false) {
@@ -385,7 +390,24 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     }
 
     function scheduleFlush() {
-        writeChain = writeChain.then(async () => {
+        pendingFlush = true;
+        if (!flushTimer) {
+            flushTimer = setTimeout(() => {
+                flushTimer = null;
+                flushPendingUpdates().catch(error => {
+                    console.warn(`Failed to flush streaming subtitles: ${error.message}`);
+                });
+            }, FLUSH_INTERVAL_MS);
+        }
+        return flushChain;
+    }
+
+    async function flushPendingUpdates() {
+        if (!pendingFlush) {
+            return flushChain;
+        }
+        pendingFlush = false;
+        flushChain = flushChain.then(async () => {
             writeRawDump();
             const rendered = renderSegmentsToSrt(segments);
             file.write(subtitlePath, rendered);
@@ -393,7 +415,15 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         }).catch(error => {
             console.warn(`Failed to update  streaming subtitles: ${error.message}`);
         });
-        return writeChain;
+        return flushChain;
+    }
+
+    async function flushNow() {
+        if (flushTimer) {
+            clearTimeout(flushTimer);
+            flushTimer = null;
+        }
+        return flushPendingUpdates();
     }
 
     function normalizeOpenAISegment(segment) {
@@ -420,7 +450,8 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             handleError,
             finalize,
             async waitForFlush() {
-                await writeChain;
+                await flushNow();
+                await flushChain;
                 writeRawDump();
                 console.log(`[Whisperina][OpenAI] Subtitle file flushed with ${segments.length} segment(s).`);
             },
