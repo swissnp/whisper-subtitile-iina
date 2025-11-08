@@ -306,7 +306,7 @@ function createOpenAIStreamHandler(subtitlePath) {
             file.write(subtitlePath, rendered);
             await reloadSubtitleTrack(subtitlePath);
         }).catch(error => {
-            console.warn(`Failed to update streaming subtitles: ${error.message}`);
+            console.warn(`Failed to update  streaming subtitles: ${error.message}`);
         });
         return writeChain;
     }
