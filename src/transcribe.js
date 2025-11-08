@@ -75,8 +75,9 @@ async function transcribeWithWhisperServer(tempWavName, modelName, sourceMediaPa
 async function transcribeWithOpenAI(tempWavName, sourceMediaPath) {
     console.log("[Whisperina] Starting OpenAI streaming transcription.");
     const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
+    const rawResponsePath = `${subtitlePath}.openai.json`;
     const preparedAudio = await prepareAudioForOpenAI(tempWavName);
-    const streamHandler = createOpenAIStreamHandler(subtitlePath);
+    const streamHandler = createOpenAIStreamHandler(subtitlePath, rawResponsePath);
     try {
         await executeOpenAIStreamingRequest(preparedAudio, streamHandler);
         await streamHandler.waitForFlush();
@@ -180,11 +181,43 @@ async function executeOpenAIStreamingRequest(upload, handler) {
     }
 }
 
-function createOpenAIStreamHandler(subtitlePath) {
+function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     let buffer = "";
     const segments = [];
     const segmentMap = new Map();
     let writeChain = Promise.resolve();
+    const rawEvents = [];
+    let rawDumpWritten = false;
+
+    function nowIso() {
+        return new Date().toISOString();
+    }
+
+    function recordRawEvent(payload) {
+        const entry = {
+            timestamp: nowIso(),
+            payload,
+        };
+        rawEvents.push(entry);
+        return entry;
+    }
+
+    function writeRawDump() {
+        if (!rawResponsePath || rawDumpWritten) {
+            return;
+        }
+        rawDumpWritten = true;
+        try {
+            const dump = {
+                generated_at: nowIso(),
+                events: rawEvents,
+            };
+            file.write(rawResponsePath, JSON.stringify(dump, null, 2));
+            console.log(`[Whisperina][OpenAI] Saved raw streaming response to ${rawResponsePath}`);
+        } catch (error) {
+            console.warn(`Failed to write raw OpenAI response: ${error.message}`);
+        }
+    }
 
     function handleChunk(data) {
         buffer += data;
@@ -199,6 +232,7 @@ function createOpenAIStreamHandler(subtitlePath) {
 
     function finalize() {
         processBuffer(true);
+        writeRawDump();
     }
 
     function processBuffer(force = false) {
@@ -222,13 +256,16 @@ function createOpenAIStreamHandler(subtitlePath) {
             return;
         }
         const payload = line.slice(5).trim();
+        const debugEntry = recordRawEvent(payload);
         if (!payload || payload === "[DONE]") {
             return;
         }
         let event;
         try {
             event = JSON.parse(payload);
+            debugEntry.parsed = event;
         } catch (error) {
+            debugEntry.parse_error = error.message;
             console.warn(`Unable to parse OpenAI SSE payload: ${error.message}`);
             return;
         }
@@ -336,6 +373,7 @@ function createOpenAIStreamHandler(subtitlePath) {
             finalize,
             async waitForFlush() {
                 await writeChain;
+                writeRawDump();
                 console.log(`[Whisperina][OpenAI] Subtitle file flushed with ${segments.length} segment(s).`);
             },
         };
