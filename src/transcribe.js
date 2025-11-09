@@ -214,8 +214,13 @@ async function executeOpenAIStreamingRequest(upload, handler) {
     }
     const result = await utils.exec("/usr/bin/env", args, null, handler.handleChunk, handler.handleError);
     handler.finalize();
+    const streamError = typeof handler.getStreamError === "function" ? handler.getStreamError() : null;
     if (result.status !== 0) {
         throw new Error(`OpenAI streaming request failed (status ${result.status}). Check your API key, quota, or model settings.`);
+    }
+    if (streamError) {
+        const suffix = streamError.code ? ` (code ${streamError.code})` : "";
+        throw new Error(`OpenAI streaming error: ${streamError.message || "unknown error"}${suffix}`);
     }
 }
 
@@ -230,6 +235,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     let rawLogReported = false;
     let rawText = "";
     const FLUSH_INTERVAL_MS = 5000;
+    let structuredError = null;
 
     function nowIso() {
         return new Date().toISOString();
@@ -270,6 +276,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             return;
         }
         rawText += chunk;
+        maybeRecordNonSseErrorChunk(chunk);
         buffer += chunk;
         processBuffer();
     }
@@ -285,6 +292,35 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         flushNow().catch(error => {
             console.warn(`Failed to flush subtitles during finalize: ${error.message}`);
         });
+    }
+
+    function recordStructuredError(errorObj) {
+        if (!errorObj || structuredError) {
+            return;
+        }
+        structuredError = {
+            message: errorObj.message || "unknown error",
+            code: errorObj.code || errorObj.type || null,
+            raw: errorObj,
+        };
+    }
+
+    function maybeRecordNonSseErrorChunk(chunk) {
+        if (structuredError) {
+            return;
+        }
+        const trimmed = (chunk || "").trim();
+        if (!trimmed || !trimmed.startsWith("{")) {
+            return;
+        }
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (parsed?.error) {
+                recordStructuredError(parsed.error);
+            }
+        } catch (error) {
+            // Ignore incomplete JSON chunks; SSE parsing will handle errors separately.
+        }
     }
 
     function processBuffer(force = false) {
@@ -339,12 +375,17 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
                 event.segments.forEach(segment => upsertSegment(segment, {skipFlush: true}));
                 scheduleFlush();
             } else if (typeof event.text === "string") {
+                if (segments.length > 0) {
+                    console.log("[Whisperina][OpenAI] Received fallback transcript text, but existing segments already populated. Skipping text-only overwrite.");
+                } else {
                 setTextOnly(event.text);
+                }
             }
             console.log(`[Whisperina][OpenAI] Received final transcript with ${segments.length} segment(s).`);
         } else if (event.type === "transcript.text.delta" && typeof event.delta === "string") {
             setTextOnly(event.delta, {append: true});
         } else if (event.type === "response.error" && event.error) {
+            recordStructuredError(event.error);
             console.error(`OpenAI response error: ${event.error.message || "unknown error"}`);
         }
     }
@@ -451,6 +492,9 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             handleChunk,
             handleError,
             finalize,
+            getStreamError() {
+                return structuredError;
+            },
             async waitForFlush() {
                 await flushNow();
                 await flushChain;
