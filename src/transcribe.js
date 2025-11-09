@@ -236,6 +236,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     let rawText = "";
     const FLUSH_INTERVAL_MS = 5000;
     let structuredError = null;
+    let hasSegmentStream = false;
 
     function nowIso() {
         return new Date().toISOString();
@@ -366,24 +367,27 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         }
         if (event.type === "transcript.text.segment" && event.segment) {
             if (upsertSegment(event.segment)) {
+                hasSegmentStream = true;
                 scheduleFlush();
             }
         } else if (event.type === "transcript.text.done") {
             if (Array.isArray(event.segments) && event.segments.length > 0) {
                 segments.length = 0;
                 segmentMap.clear();
-                event.segments.forEach(segment => upsertSegment(segment, {skipFlush: true}));
+                event.segments.forEach(segment => {
+                    if (upsertSegment(segment, {skipFlush: true})) {
+                        hasSegmentStream = true;
+                    }
+                });
                 scheduleFlush();
-            } else if (typeof event.text === "string") {
-                if (segments.length > 0) {
-                    console.log("[Whisperina][OpenAI] Received fallback transcript text, but existing segments already populated. Skipping text-only overwrite.");
-                } else {
+            } else if (!hasSegmentStream && typeof event.text === "string") {
                 setTextOnly(event.text);
-                }
             }
             console.log(`[Whisperina][OpenAI] Received final transcript with ${segments.length} segment(s).`);
         } else if (event.type === "transcript.text.delta" && typeof event.delta === "string") {
-            setTextOnly(event.delta, {append: true});
+            if (!hasSegmentStream) {
+                setTextOnly(event.delta, {append: true});
+            }
         } else if (event.type === "response.error" && event.error) {
             recordStructuredError(event.error);
             console.error(`OpenAI response error: ${event.error.message || "unknown error"}`);
@@ -411,6 +415,9 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     }
 
     function setTextOnly(text, options = {}) {
+        if (hasSegmentStream) {
+            return;
+        }
         const content = (options.append && segments.length > 0)
             ? `${segments[segments.length - 1].textLines.join(" ")} ${text}`.trim()
             : (text || "").trim();
