@@ -238,6 +238,14 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     let structuredError = null;
     let hasSegmentStream = false;
 
+    const debugLog = (...parts) => {
+        try {
+            console.log("[Whisperina][OpenAI][Stream]", ...parts);
+        } catch (error) {
+            // ignore logging failures
+        }
+    };
+
     function nowIso() {
         return new Date().toISOString();
     }
@@ -279,6 +287,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         rawText += chunk;
         maybeRecordNonSseErrorChunk(chunk);
         buffer += chunk;
+        debugLog("Received chunk", {length: chunk.length, buffer: buffer.length});
         processBuffer();
     }
 
@@ -289,6 +298,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
     }
 
     function finalize() {
+        debugLog("Finalize invoked; flushing buffer.");
         processBuffer(true);
         flushNow().catch(error => {
             console.warn(`Failed to flush subtitles during finalize: ${error.message}`);
@@ -304,6 +314,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             code: errorObj.code || errorObj.type || null,
             raw: errorObj,
         };
+        debugLog("Structured error recorded", structuredError);
     }
 
     function maybeRecordNonSseErrorChunk(chunk) {
@@ -318,6 +329,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             const parsed = JSON.parse(trimmed);
             if (parsed?.error) {
                 recordStructuredError(parsed.error);
+                debugLog("Detected error JSON outside SSE", parsed.error);
             }
         } catch (error) {
             // Ignore incomplete JSON chunks; SSE parsing will handle errors separately.
@@ -347,6 +359,9 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         const payload = line.slice(5).trim();
         const debugEntry = recordRawEvent(payload);
         if (!payload || payload === "[DONE]") {
+            if (payload === "[DONE]") {
+                debugLog("SSE stream signaled completion.");
+            }
             return;
         }
         let event;
@@ -358,6 +373,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             console.warn(`Unable to parse OpenAI SSE payload: ${error.message}`);
             return;
         }
+        debugLog("Parsed SSE event", {type: event.type, id: event.id || null});
         handleEvent(event);
     }
 
@@ -368,10 +384,16 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         if (event.type === "transcript.text.segment" && event.segment) {
             if (upsertSegment(event.segment)) {
                 hasSegmentStream = true;
+                debugLog("Live diarized segment received", {
+                    id: event.segment.id,
+                    start: event.segment.start,
+                    end: event.segment.end,
+                });
                 scheduleFlush();
             }
         } else if (event.type === "transcript.text.done") {
             if (Array.isArray(event.segments) && event.segments.length > 0) {
+                debugLog("Final diarized segments array received", event.segments.length);
                 segments.length = 0;
                 segmentMap.clear();
                 event.segments.forEach(segment => {
@@ -381,15 +403,18 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
                 });
                 scheduleFlush();
             } else if (!hasSegmentStream && typeof event.text === "string") {
+                debugLog("Falling back to full-text transcript (no diarized segments).");
                 setTextOnly(event.text);
             }
             console.log(`[Whisperina][OpenAI] Received final transcript with ${segments.length} segment(s).`);
         } else if (event.type === "transcript.text.delta" && typeof event.delta === "string") {
             if (!hasSegmentStream) {
+                debugLog("Applying interim text delta.");
                 setTextOnly(event.delta, {append: true});
             }
         } else if (event.type === "response.error" && event.error) {
             recordStructuredError(event.error);
+            debugLog("Received response.error event", event.error);
             console.error(`OpenAI response error: ${event.error.message || "unknown error"}`);
         }
     }
@@ -401,8 +426,10 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         }
         const existingIndex = segmentMap.has(normalized.id) ? segmentMap.get(normalized.id) : -1;
         if (existingIndex >= 0) {
+            debugLog("Updating segment entry", normalized.id);
             segments[existingIndex] = normalized;
         } else {
+            debugLog("Appending new segment entry", normalized.id);
             segmentMap.set(normalized.id, segments.length);
             segments.push(normalized);
             segments.sort((a, b) => a.startMs - b.startMs);
@@ -416,6 +443,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
 
     function setTextOnly(text, options = {}) {
         if (hasSegmentStream) {
+            debugLog("Ignoring text-only update because diarized segments exist.");
             return;
         }
         const content = (options.append && segments.length > 0)
@@ -427,6 +455,10 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
         const estimatedDuration = getMediaDurationMs() || estimateDurationFromText(content);
         segments.length = 0;
         segmentMap.clear();
+        debugLog("Setting text-only transcript", {
+            preview: content.slice(0, 80),
+            estimatedDurationMs: estimatedDuration,
+        });
         segments.push({
             id: "text-only",
             startMs: 0,
@@ -439,6 +471,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
 
     function scheduleFlush() {
         pendingFlush = true;
+        debugLog("scheduleFlush called", {pendingFlush, timerActive: Boolean(flushTimer), segments: segments.length});
         if (!flushTimer) {
             flushTimer = setTimeout(() => {
                 flushTimer = null;
@@ -452,9 +485,11 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
 
     async function flushPendingUpdates() {
         if (!pendingFlush) {
+            debugLog("flushPendingUpdates invoked but nothing pending.");
             return flushChain;
         }
         pendingFlush = false;
+        debugLog("Flushing pending updates now.", {segments: segments.length});
         flushChain = flushChain.then(async () => {
             writeRawDump();
             const rendered = renderSegmentsToSrt(segments);
@@ -471,6 +506,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
             clearTimeout(flushTimer);
             flushTimer = null;
         }
+        debugLog("flushNow forcing immediate flush.");
         return flushPendingUpdates();
     }
 
@@ -503,6 +539,7 @@ function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
                 return structuredError;
             },
             async waitForFlush() {
+                debugLog("waitForFlush awaiting outstanding flush tasks.");
                 await flushNow();
                 await flushChain;
                 writeRawDump();
