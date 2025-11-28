@@ -105,448 +105,127 @@ async function transcribeWithWhisperServer(tempWavName, modelName, sourceMediaPa
 }
 
 async function transcribeWithOpenAI(tempWavName, sourceMediaPath) {
-    console.log("[Whisperina] Starting OpenAI streaming transcription.");
+    console.log("[Whisperina] Starting OpenAI transcription (non-streaming).");
     const subtitlePath = utils.resolvePath("@tmp/whisper_tmp.wav.srt");
     const rawResponsePath = `${subtitlePath}.openai.json`;
+
     const preparedAudio = await prepareAudioForOpenAI(tempWavName);
-    const streamHandler = createOpenAIStreamHandler(subtitlePath, rawResponsePath);
+
     try {
-        await executeOpenAIStreamingRequest(preparedAudio, streamHandler);
-        await streamHandler.waitForFlush();
+        const responseBody = await executeOpenAIRequest(preparedAudio);
+
+        // Save raw response for debugging
+        file.write(rawResponsePath, responseBody);
+        console.log(`[Whisperina][OpenAI] Saved raw response to ${rawResponsePath}`);
+
+        let srtContent = "";
+
+        // Try to parse as JSON
+        try {
+            const json = JSON.parse(responseBody);
+            // Handle standard OpenAI verbose_json or similar formats
+            if (json.segments && Array.isArray(json.segments)) {
+                 const segments = json.segments.map(normalizeOpenAISegment).filter(Boolean);
+                 srtContent = renderSegmentsToSrt(segments);
+            } else if (json.text) {
+                // Fallback to text-only
+                 const segments = [{
+                    text: json.text,
+                    startMs: 0,
+                    endMs: estimateDurationFromText(json.text)
+                }].map(normalizeOpenAISegment);
+                srtContent = renderSegmentsToSrt(segments);
+            } else if (json.error) {
+                throw new Error(json.error.message || JSON.stringify(json.error));
+            } else {
+                 // Unknown JSON structure, maybe it IS srt wrapped in JSON? Unlikely.
+                 // If response_format was srt, we wouldn't be here (parsing would likely fail or it would be a string).
+                 console.warn("Unknown JSON structure:", json);
+            }
+        } catch (e) {
+            // Not JSON? Maybe it is raw SRT or VTT?
+            if (responseBody.trim().startsWith("WEBVTT") || responseBody.includes("-->")) {
+                 srtContent = responseBody;
+            } else {
+                 // Maybe it failed to parse JSON but wasn't SRT.
+                 // Re-throw if it wasn't a "valid but not JSON" case?
+                 // Actually if responseBody is just text, maybe treat as text?
+                 console.warn("Failed to parse response as JSON, treating as text/srt if possible.", e);
+                 if (responseBody.length > 0) {
+                     srtContent = responseBody;
+                 }
+            }
+        }
+
+        if (!srtContent) {
+            throw new Error("No subtitle content generated from API response.");
+        }
+
+        file.write(subtitlePath, srtContent);
         await persistSubtitleCopy(subtitlePath, sourceMediaPath);
         console.log("[Whisperina] OpenAI transcription finished.");
         return subtitlePath;
-    } finally {
-        await streamHandler.waitForFlush().catch(() => {});
-    }
-}
-
-async function streamTranscription(serverInfo, wavPath, subtitlePath) {
-    const monitor = startLogMonitor(serverInfo.logPath, subtitlePath);
-    console.log("[Whisperina] Streaming captions from whisper-server log output.");
-    let transcriptionError = null;
-    try {
-        const finalSrt = await requestTranscriptionFromServer(serverInfo, wavPath);
-        await monitor.finalize(finalSrt);
     } catch (error) {
-        transcriptionError = error;
-        await monitor.finalize(null);
-    }
-    if (transcriptionError) {
-        throw transcriptionError;
+        console.error(`[Whisperina] OpenAI transcription failed: ${error.message}`);
+        throw error;
     }
 }
 
-async function reloadSubtitleTrack(subtitlePath) {
-    try {
-        core.subtitle.loadTrack(subtitlePath);
-    } catch (error) {
-        console.warn(`Failed to reload subtitle track: ${error.message}`);
-    }
-}
-
-export function isOpenAIMode() {
-    const modeRaw = preferences.get("transcriber_mode");
-    const mode = (modeRaw === undefined || modeRaw === null ? "whisper_server" : `${modeRaw}`).trim().toLowerCase();
-    return mode === "openai";
-}
-
-async function prepareAudioForOpenAI(wavPath) {
-    const currentSize = await statFileSize(wavPath);
-    console.log(`[Whisperina][OpenAI] Source WAV size: ${(currentSize / (1024 * 1024)).toFixed(2)} MB.`);
-    if (currentSize <= OPENAI_SIZE_LIMIT_BYTES) {
-        return {path: wavPath, mime: "audio/wav"};
-    }
-
-    for (const profile of OPENAI_AUDIO_PROFILES) {
-        const outputPath = utils.resolvePath(`@tmp/whisper_tmp_openai.${profile.ext}`);
-        console.log(`[Whisperina][OpenAI] WAV exceeds 25 MB, re-encoding using ${profile.description}.`);
-        await convertAudioWithFfmpeg(wavPath, outputPath, profile);
-        const newSize = await statFileSize(outputPath);
-        console.log(`[Whisperina][OpenAI] ${profile.ext.toUpperCase()} size: ${(newSize / (1024 * 1024)).toFixed(2)} MB.`);
-        if (newSize <= OPENAI_SIZE_LIMIT_BYTES) {
-            console.log(`[Whisperina][OpenAI] Selected ${profile.description} for upload.`);
-            return {path: outputPath, mime: profile.mime};
-        }
-        console.log(`[Whisperina][OpenAI] ${profile.description} still exceeds 25 MB, trying next profile...`);
-    }
-
-    throw new Error("Audio file is still larger than 25 MB even after trying high-compression profiles. Please trim the media or lower its quality.");
-}
-
-async function statFileSize(path) {
-    const output = await execWrapped("/usr/bin/stat", ["-f", "%z", path], null, {silent: true});
-    const size = parseInt(output.trim(), 10);
-    return Number.isFinite(size) ? size : 0;
-}
-
-async function convertAudioWithFfmpeg(inputPath, outputPath, codecOptions) {
-    const args = ['-y', '-i', inputPath].concat(codecOptions.ffmpegArgs || []).concat([outputPath]);
-    await execWrapped(getFfmpegPath(), args);
-    return outputPath;
-}
-
-async function executeOpenAIStreamingRequest(upload, handler) {
+async function executeOpenAIRequest(upload) {
     const apiKey = (preferences.get("openai_api_key") || "").trim();
     if (!apiKey) {
         throw new Error("OpenAI API key is not configured. Please update the preferences page.");
     }
     const baseUrl = (preferences.get("openai_base_url") || "https://api.openai.com/v1/audio/transcriptions").trim();
     const model = (preferences.get("openai_model") || "gpt-4o-transcribe-diarize").trim();
-    const responseFormat = (preferences.get("openai_response_format") || "diarized_json").trim() || "diarized_json";
-    const chunkingStrategy = (preferences.get("openai_chunking_strategy") || "").trim();
+    // Default to verbose_json to get segments
+    let responseFormat = (preferences.get("openai_response_format") || "").trim();
+    if (!responseFormat || responseFormat === "diarized_json") {
+         // diarized_json was for the streaming custom backend; fallback to verbose_json for standard compatibility
+         // or if the custom backend supports verbose_json with diarization.
+         responseFormat = "verbose_json";
+    }
 
-    console.log(`[Whisperina][OpenAI] Streaming request -> model=${model}, response_format=${responseFormat}, chunking=${chunkingStrategy || "default"}, endpoint=${baseUrl}`);
+    console.log(`[Whisperina][OpenAI] Request -> model=${model}, response_format=${responseFormat}, endpoint=${baseUrl}`);
+
     const args = [
         "curl",
-        "-sN",
+        "-sS",
         "-X", "POST",
         baseUrl,
         "-H", `Authorization: Bearer ${apiKey}`,
-        "-H", "Accept: text/event-stream",
         "-F", `file=@${upload.path}`,
         "-F", `model=${model}`,
         "-F", `response_format=${responseFormat}`,
-        "-F", "stream=true",
     ];
-    if (chunkingStrategy) {
-        args.push("-F", `chunking_strategy=${chunkingStrategy}`);
-    }
-    const result = await utils.exec("/usr/bin/env", args, null, handler.handleChunk, handler.handleError);
-    handler.finalize();
-    const streamError = typeof handler.getStreamError === "function" ? handler.getStreamError() : null;
-    if (result.status !== 0) {
-        throw new Error(`OpenAI streaming request failed (status ${result.status}). Check your API key, quota, or model settings.`);
-    }
-    if (streamError) {
-        const suffix = streamError.code ? ` (code ${streamError.code})` : "";
-        throw new Error(`OpenAI streaming error: ${streamError.message || "unknown error"}${suffix}`);
-    }
+
+    const stdout = await execWrapped("/usr/bin/env", args, null, {silent: true});
+    return stdout;
 }
 
-function createOpenAIStreamHandler(subtitlePath, rawResponsePath) {
-    let buffer = "";
-    const segments = [];
-    const segmentMap = new Map();
-    let flushChain = Promise.resolve();
-    let flushTimer = null;
-    let pendingFlush = false;
-    const rawEvents = [];
-    let rawLogReported = false;
-    let rawText = "";
-    const FLUSH_INTERVAL_MS = 5000;
-    let structuredError = null;
-    let hasSegmentStream = false;
-
-    const debugLog = (...parts) => {
-        try {
-            console.log("[Whisperina][OpenAI][Stream]", ...parts);
-        } catch (error) {
-            // ignore logging failures
-        }
+function normalizeOpenAISegment(segment) {
+    if (!segment) {
+        return null;
+    }
+    const text = (segment.text || "").trim();
+    if (!text) {
+        return null;
+    }
+    const startMs = secondsToMs(segment.start ?? segment.start_time ?? 0);
+    const endMs = secondsToMs(segment.end ?? segment.end_time ?? startMs + 2);
+    // Standard OpenAI segments use 'id' as integer usually, but we convert to string or whatever
+    const id = segment.id !== undefined ? String(segment.id) : `${startMs}-${endMs}`;
+    const speaker = typeof segment.speaker === "string" ? segment.speaker.trim() : null;
+    const formattedText = speaker ? `${speaker}: ${text}` : text;
+    
+    return {
+        id,
+        startMs,
+        endMs,
+        textLines: splitTextIntoLines(formattedText),
     };
-
-    function nowIso() {
-        return new Date().toISOString();
-    }
-
-    function recordRawEvent(payload) {
-        const entry = {
-            timestamp: nowIso(),
-            payload,
-        };
-        rawEvents.push(entry);
-        return entry;
-    }
-
-    function writeRawDump() {
-        if (!rawResponsePath) {
-            return;
-        }
-        try {
-            const dump = {
-                generated_at: nowIso(),
-                raw_text: rawText,
-                events: rawEvents,
-            };
-            file.write(rawResponsePath, JSON.stringify(dump, null, 2));
-            if (!rawLogReported) {
-                rawLogReported = true;
-                console.log(`[Whisperina][OpenAI] Saved raw streaming response to ${rawResponsePath}`);
-            }
-        } catch (error) {
-            console.warn(`Failed to write raw OpenAI response: ${error.message}`);
-        }
-    }
-
-    function handleChunk(data) {
-        const chunk = coerceChunkToString(data);
-        if (!chunk) {
-            return;
-        }
-        rawText += chunk;
-        maybeRecordNonSseErrorChunk(chunk);
-        buffer += chunk;
-        debugLog("Received chunk", {length: chunk.length, buffer: buffer.length});
-        processBuffer();
-    }
-
-    function handleError(data) {
-        if (data && data.trim().length > 0) {
-            console.warn(`OpenAI stream stderr: ${data}`);
-        }
-    }
-
-    function finalize() {
-        debugLog("Finalize invoked; flushing buffer.");
-        processBuffer(true);
-        flushNow().catch(error => {
-            console.warn(`Failed to flush subtitles during finalize: ${error.message}`);
-        });
-    }
-
-    function recordStructuredError(errorObj) {
-        if (!errorObj || structuredError) {
-            return;
-        }
-        structuredError = {
-            message: errorObj.message || "unknown error",
-            code: errorObj.code || errorObj.type || null,
-            raw: errorObj,
-        };
-        debugLog("Structured error recorded", structuredError);
-    }
-
-    function maybeRecordNonSseErrorChunk(chunk) {
-        if (structuredError) {
-            return;
-        }
-        const trimmed = (chunk || "").trim();
-        if (!trimmed || !trimmed.startsWith("{")) {
-            return;
-        }
-        try {
-            const parsed = JSON.parse(trimmed);
-            if (parsed?.error) {
-                recordStructuredError(parsed.error);
-                debugLog("Detected error JSON outside SSE", parsed.error);
-            }
-        } catch (error) {
-            // Ignore incomplete JSON chunks; SSE parsing will handle errors separately.
-        }
-    }
-
-    function processBuffer(force = false) {
-        let newlineIndex;
-        while ((newlineIndex = buffer.indexOf("\n")) >= 0) {
-            const line = buffer.slice(0, newlineIndex).trim();
-            buffer = buffer.slice(newlineIndex + 1);
-            processLine(line);
-        }
-        if (force && buffer.trim().length > 0) {
-            processLine(buffer.trim());
-            buffer = "";
-        }
-    }
-
-    function processLine(line) {
-        if (!line || line.startsWith(":")) {
-            return;
-        }
-        if (!line.startsWith("data:")) {
-            return;
-        }
-        const payload = line.slice(5).trim();
-        const debugEntry = recordRawEvent(payload);
-        if (!payload || payload === "[DONE]") {
-            if (payload === "[DONE]") {
-                debugLog("SSE stream signaled completion.");
-            }
-            return;
-        }
-        let event;
-        try {
-            event = JSON.parse(payload);
-            debugEntry.parsed = event;
-        } catch (error) {
-            debugEntry.parse_error = error.message;
-            console.warn(`Unable to parse OpenAI SSE payload: ${error.message}`);
-            return;
-        }
-        debugLog("Parsed SSE event", {type: event.type, id: event.id || null});
-        handleEvent(event);
-    }
-
-    function handleEvent(event) {
-        if (!event || typeof event !== "object") {
-            return;
-        }
-        if (event.type === "transcript.text.segment" && event.segment) {
-            if (upsertSegment(event.segment)) {
-                hasSegmentStream = true;
-                debugLog("Live diarized segment received", {
-                    id: event.segment.id,
-                    start: event.segment.start,
-                    end: event.segment.end,
-                });
-                scheduleFlush();
-            }
-        } else if (event.type === "transcript.text.done") {
-            if (Array.isArray(event.segments) && event.segments.length > 0) {
-                debugLog("Final diarized segments array received", event.segments.length);
-                segments.length = 0;
-                segmentMap.clear();
-                event.segments.forEach(segment => {
-                    if (upsertSegment(segment, {skipFlush: true})) {
-                        hasSegmentStream = true;
-                    }
-                });
-                scheduleFlush();
-            } else if (!hasSegmentStream && typeof event.text === "string") {
-                debugLog("Falling back to full-text transcript (no diarized segments).");
-                setTextOnly(event.text);
-            }
-            console.log(`[Whisperina][OpenAI] Received final transcript with ${segments.length} segment(s).`);
-        } else if (event.type === "transcript.text.delta" && typeof event.delta === "string") {
-            if (!hasSegmentStream) {
-                debugLog("Applying interim text delta.");
-                setTextOnly(event.delta, {append: true});
-            }
-        } else if (event.type === "response.error" && event.error) {
-            recordStructuredError(event.error);
-            debugLog("Received response.error event", event.error);
-            console.error(`OpenAI response error: ${event.error.message || "unknown error"}`);
-        }
-    }
-
-    function upsertSegment(rawSegment, options = {}) {
-        const normalized = normalizeOpenAISegment(rawSegment);
-        if (!normalized) {
-            return false;
-        }
-        const existingIndex = segmentMap.has(normalized.id) ? segmentMap.get(normalized.id) : -1;
-        if (existingIndex >= 0) {
-            debugLog("Updating segment entry", normalized.id);
-            segments[existingIndex] = normalized;
-        } else {
-            debugLog("Appending new segment entry", normalized.id);
-            segmentMap.set(normalized.id, segments.length);
-            segments.push(normalized);
-            segments.sort((a, b) => a.startMs - b.startMs);
-            segments.forEach((segment, index) => segmentMap.set(segment.id, index));
-        }
-        if (!options.skipFlush) {
-            scheduleFlush();
-        }
-        return true;
-    }
-
-    function setTextOnly(text, options = {}) {
-        if (hasSegmentStream) {
-            debugLog("Ignoring text-only update because diarized segments exist.");
-            return;
-        }
-        const content = (options.append && segments.length > 0)
-            ? `${segments[segments.length - 1].textLines.join(" ")} ${text}`.trim()
-            : (text || "").trim();
-        if (!content) {
-            return;
-        }
-        const estimatedDuration = getMediaDurationMs() || estimateDurationFromText(content);
-        segments.length = 0;
-        segmentMap.clear();
-        debugLog("Setting text-only transcript", {
-            preview: content.slice(0, 80),
-            estimatedDurationMs: estimatedDuration,
-        });
-        segments.push({
-            id: "text-only",
-            startMs: 0,
-            endMs: estimatedDuration,
-            textLines: splitTextIntoLines(content),
-        });
-        segmentMap.set("text-only", 0);
-        scheduleFlush();
-    }
-
-    function scheduleFlush() {
-        pendingFlush = true;
-        debugLog("scheduleFlush called", {pendingFlush, timerActive: Boolean(flushTimer), segments: segments.length});
-        if (!flushTimer) {
-            flushTimer = setTimeout(() => {
-                flushTimer = null;
-                flushPendingUpdates().catch(error => {
-                    console.warn(`Failed to flush streaming subtitles: ${error.message}`);
-                });
-            }, FLUSH_INTERVAL_MS);
-        }
-        return flushChain;
-    }
-
-    async function flushPendingUpdates() {
-        if (!pendingFlush) {
-            debugLog("flushPendingUpdates invoked but nothing pending.");
-            return flushChain;
-        }
-        pendingFlush = false;
-        debugLog("Flushing pending updates now.", {segments: segments.length});
-        flushChain = flushChain.then(async () => {
-            writeRawDump();
-            const rendered = renderSegmentsToSrt(segments);
-            file.write(subtitlePath, rendered);
-            await reloadSubtitleTrack(subtitlePath);
-        }).catch(error => {
-            console.warn(`Failed to update  streaming subtitles: ${error.message}`);
-        });
-        return flushChain;
-    }
-
-    async function flushNow() {
-        if (flushTimer) {
-            clearTimeout(flushTimer);
-            flushTimer = null;
-        }
-        debugLog("flushNow forcing immediate flush.");
-        return flushPendingUpdates();
-    }
-
-    function normalizeOpenAISegment(segment) {
-        if (!segment) {
-            return null;
-        }
-        const text = (segment.text || "").trim();
-        if (!text) {
-            return null;
-        }
-        const startMs = secondsToMs(segment.start ?? segment.start_time ?? 0);
-        const endMs = secondsToMs(segment.end ?? segment.end_time ?? startMs + 2);
-        const id = segment.id || `${startMs}-${endMs}-${text.length}`;
-        const speaker = typeof segment.speaker === "string" ? segment.speaker.trim() : null;
-        const formattedText = speaker ? `${speaker}: ${text}` : text;
-        return {
-            id,
-            startMs,
-            endMs,
-            textLines: splitTextIntoLines(formattedText),
-        };
-    }
-
-        return {
-            handleChunk,
-            handleError,
-            finalize,
-            getStreamError() {
-                return structuredError;
-            },
-            async waitForFlush() {
-                debugLog("waitForFlush awaiting outstanding flush tasks.");
-                await flushNow();
-                await flushChain;
-                writeRawDump();
-                console.log(`[Whisperina][OpenAI] Subtitle file flushed with ${segments.length} segment(s).`);
-            },
-        };
 }
+
 
 function coerceChunkToString(data) {
     if (data === undefined || data === null) {
